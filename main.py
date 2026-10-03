@@ -14,7 +14,7 @@ from pydantic import BaseModel
 app = FastAPI()
 
 
-# Enable CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,16 +38,6 @@ class ErrorAnalysis(BaseModel):
 
 
 def execute_python_code(code: str) -> dict:
-    """
-    Execute Python code and return exact output.
-
-    Returns:
-        {
-            "success": bool,
-            "output": str
-        }
-    """
-
     old_stdout = sys.stdout
     old_stderr = sys.stderr
 
@@ -60,22 +50,15 @@ def execute_python_code(code: str) -> dict:
     try:
         exec(code, {})
 
-        output = (
-            stdout_buffer.getvalue()
-            + stderr_buffer.getvalue()
-        )
-
         return {
             "success": True,
-            "output": output
+            "output": stdout_buffer.getvalue() + stderr_buffer.getvalue()
         }
 
     except Exception:
-        output = traceback.format_exc()
-
         return {
             "success": False,
-            "output": output
+            "output": traceback.format_exc()
         }
 
     finally:
@@ -85,7 +68,7 @@ def execute_python_code(code: str) -> dict:
 
 def extract_traceback_lines(traceback_text: str) -> List[int]:
     """
-    Extract line numbers from Python traceback.
+    Get the last Python source line mentioned in the traceback.
     """
     matches = re.findall(r'line (\d+)', traceback_text)
 
@@ -95,89 +78,90 @@ def extract_traceback_lines(traceback_text: str) -> List[int]:
     return []
 
 
-def analyze_error_with_ai(
-    code: str,
-    traceback_text: str
-) -> List[int]:
+def analyze_error_with_ai(code: str, traceback_text: str) -> List[int]:
     """
-    Use AIPipe LLM to identify the source-code error line.
+    Ask AIPipe LLM to identify source error lines.
+    Fall back to traceback extraction if AI call fails.
     """
+
+    fallback = extract_traceback_lines(traceback_text)
 
     token = os.environ.get("AIPIPE_TOKEN")
 
     if not token:
-        return extract_traceback_lines(traceback_text)
+        return fallback
 
-    client = OpenAI(
-        api_key=token,
-        base_url="https://aipipe.org/openrouter/v1"
-    )
+    try:
+        client = OpenAI(
+            api_key=token,
+            base_url="https://aipipe.org/openrouter/v1"
+        )
 
-    prompt = f"""
-Analyze the following Python code and traceback.
+        prompt = f"""
+Analyze this Python code and its traceback.
 
-Your task is to identify the exact line number or line numbers
-in the ORIGINAL CODE where the error occurred.
+Find the exact line number(s) in the ORIGINAL CODE
+where the error occurred.
 
-Rules:
-1. Return only source-code line numbers.
-2. Do not return internal Python library lines.
-3. For a runtime error, return the line containing the failing statement.
-4. For a syntax error, return the source line indicated by the traceback.
-5. Return a JSON object exactly like:
+Return ONLY one JSON object in this exact format:
 {{"error_lines":[3]}}
 
-ORIGINAL CODE:
+Do not include markdown.
+Do not include explanations.
+Do not include library/internal Python lines.
+
+CODE:
 {code}
 
 TRACEBACK:
 {traceback_text}
 """
 
-    response = client.chat.completions.create(
-        model="google/gemini-2.0-flash-lite-001",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise Python traceback analyzer. "
-                    "Return valid JSON only."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        response_format={
-            "type": "json_object"
-        },
-        temperature=0
-    )
+        response = client.chat.completions.create(
+            model="google/gemini-2.0-flash-lite-001",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise Python traceback analyzer. "
+                        "Return JSON only."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0
+        )
 
-    content = response.choices[0].message.content
+        content = response.choices[0].message.content.strip()
 
-    try:
+        # Remove accidental markdown fences
+        content = re.sub(r"^```json\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+
         result = ErrorAnalysis.model_validate_json(content)
+
         return result.error_lines
 
     except Exception:
-        return extract_traceback_lines(traceback_text)
+        # Never let the AI service failure break our API
+        return fallback
 
 
 @app.post("/code-interpreter", response_model=CodeResponse)
 def code_interpreter(request: CodeRequest):
-
     execution = execute_python_code(request.code)
 
-    # No AI call when execution succeeds
+    # Successful execution: AI is NOT called
     if execution["success"]:
         return {
             "error": [],
             "result": execution["output"]
         }
 
-    # AI is called only when an error occurs
+    # Error case: analyze with AI
     error_lines = analyze_error_with_ai(
         request.code,
         execution["output"]

@@ -92,7 +92,7 @@ TRACEBACK:
 """
 
     response = client.chat.completions.create(
-        model="openai/gpt-4.1-nano",
+        model="gpt-5-nano",
         messages=[
             {
                 "role": "system",
